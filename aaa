@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>リアルタイム地震・津波モニター（リモート対応）</title>
+    <!-- Leaflet.js（地図ライブラリ）のCSS読み込み -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <!-- PeerJS（P2P通信ライブラリ：リモコン用） -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    
+    <style>
+        body { margin: 0; font-family: sans-serif; background: #111; color: #fff; overflow: hidden; }
+        
+        /* モニター画面のレイアウト */
+        #monitor-view { display: flex; width: 100vw; height: 100vh; }
+        #sidebar { width: 380px; padding: 20px; background: #222; box-sizing: border-box; display: flex; flex-direction: column; justify-content: space-between; z-index: 1000; overflow-y: auto; height: 100vh; }
+        #map { flex-grow: 1; height: 100vh; }
+        
+        h2 { color: #ffcc00; margin-top: 0; font-size: 20px; }
+        .info-box { margin: 8px 0; font-size: 14px; }
+        .val { color: #00ffff; font-weight: bold; }
+        #status { font-size: 12px; color: #00ff88; }
+        
+        .wave-panel { background: #1a1a1a; border: 1px solid #444; border-radius: 6px; padding: 10px; margin-top: 10px; }
+        .wave-status { font-weight: bold; font-size: 13px; margin-bottom: 4px; }
+        
+        .stop-btn { width: 100%; background: #444; color: #fff; font-weight: bold; border: 1px solid #777; padding: 8px; font-size: 13px; border-radius: 4px; cursor: pointer; margin-top: 15px; }
+        .stop-btn:hover { background: #666; }
+
+        .test-toggle-btn { background: #222; color: #ffcc00; border: 1px solid #ffcc00; padding: 5px 10px; font-size: 12px; border-radius: 4px; cursor: pointer; margin-top: 10px; }
+        .test-panel { background: #2a2a2a; padding: 12px; border-radius: 8px; border: 1px dashed #ffcc00; margin-top: 10px; display: none; }
+        .test-input { width: 100%; box-sizing: border-box; padding: 5px; margin-top: 3px; margin-bottom: 6px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; font-size: 13px; }
+        .test-btn { width: 100%; background: #ffcc00; color: #111; font-weight: bold; padding: 6px; border: none; border-radius: 4px; cursor: pointer; margin-top: 5px; }
+        
+        .remote-info { background: #004488; padding: 10px; border-radius: 6px; margin-top: 15px; font-size: 12px; word-break: break-all; }
+        
+        .tsunami-alert { background: #ff3333; color: white; padding: 8px 10px; border-radius: 4px; font-weight: bold; display: inline-block; margin-top: 5px; }
+        .notification-banner { background: #ff3333; color: white; padding: 8px; border-radius: 4px; font-weight: bold; text-align: center; margin-bottom: 10px; animation: flash 1s infinite; }
+        @keyframes flash { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
+
+        /* スマホ用リモコン画面のレイアウト */
+        #remote-view { display: none; flex-direction: column; align-items: center; justify-content: center; height: 100vh; padding: 20px; background: #111; text-align: center; box-sizing: border-box; }
+        .remote-btn { width: 100%; max-width: 400px; padding: 25px; margin: 15px 0; font-size: 20px; font-weight: bold; border-radius: 12px; border: none; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+        .remote-btn-stop { background: #ff3333; color: white; }
+        .remote-btn-test { background: #ffcc00; color: #111; }
+    </style>
+</head>
+<body>
+
+    <!-- ==================== PCモニター画面 ==================== -->
+    <div id="monitor-view">
+        <div id="sidebar">
+            <div>
+                <h2>⚠️ 地震・津波モニター</h2>
+                <div id="alertArea"></div>
+                <div class="info-box">ステータス: <span id="status" class="val">1秒単位で監視中...</span></div>
+                <hr>
+                <div class="info-box">発生時刻: <span id="eqTime" class="val">-</span></div>
+                <div class="info-box">震源地: <span id="hypo" class="val">-</span></div>
+                <div class="info-box">マグニチュード: <span id="mag" class="val">-</span></div>
+                <div class="info-box">深さ: <span id="depth" class="val">-</span></div>
+                <div class="info-box">最大震度: <span id="maxScale" class="val">-</span></div>
+                <div id="tsunamiArea"></div>
+
+                <div class="wave-panel">
+                    <div style="color: #ffcc00; font-size: 13px; font-weight: bold; margin-bottom: 5px;">🏠 自宅へのP波・S波 到達予測</div>
+                    <div class="wave-status" id="pWaveStatus" style="color: #00ffff;">P波 (初期微動): 待機中</div>
+                    <div class="wave-status" id="sWaveStatus" style="color: #ff5555;">S波 (主要動): 待機中</div>
+                </div>
+
+                <!-- 停止ボタン -->
+                <button class="stop-btn" onclick="stopAudioAndSpeech()">🔇 読み上げ・警報音を停止する</button>
+
+                <!-- リモートコントロール情報 -->
+                <div class="remote-info">
+                    <b style="color:#00ffff;">📱 スマホでリモート操作</b><br>
+                    <span style="color:#ccc;">以下のリンクをスマホで開くとリモコンになります。</span><br>
+                    <a id="remote-link" href="#" target="_blank" style="color:#ffcc00; display:block; margin-top:5px;">生成中...</a>
+                </div>
+
+                <button class="test-toggle-btn" onclick="toggleTestPanel()">⚙️ テストパネルを開閉</button>
+                <div id="testPanel" class="test-panel">
+                    <h3 style="color: #ffcc00; margin: 0 0 8px 0; font-size: 14px;">🧪 テストシミュレーター</h3>
+                    <input type="text" id="testName" class="test-input" value="石川県能登地方">
+                    <input type="number" step="0.1" id="testMag" class="test-input" value="6.5">
+                    <input type="number" id="testDepth" class="test-input" value="10">
+                    <select id="testScale" class="test-input">
+                        <option value="10">震度1</option><option value="30">震度3</option>
+                        <option value="45" selected>震度5弱</option><option value="60">震度6強</option>
+                    </select>
+                    <select id="testTsunami" class="test-input">
+                        <option value="None">なし</option>
+                        <option value="Checking">調査中</option>
+                        <option value="Warning">津波警報等</option>
+                    </select>
+                    <button class="test-btn" onclick="runTestSimulation()">テスト発報</button>
+                </div>
+            </div>
+            <div style="font-size: 11px; color: #888; margin-top: 15px;">1秒ごとにポーリング監視中</div>
+        </div>
+        <div id="map"></div>
+    </div>
+
+    <!-- ==================== スマホリモコン画面 ==================== -->
+    <div id="remote-view">
+        <h2 style="color: #ffcc00; margin-bottom: 10px;">📱 リモートコントローラー</h2>
+        <div id="remote-status" style="color: #ccc; margin-bottom: 30px;">PCに接続中...⏳</div>
+        
+        <button class="remote-btn remote-btn-stop" onclick="sendRemoteCmd('STOP')">
+            🔇 音声・警報を強制停止
+        </button>
+        
+        <button class="remote-btn remote-btn-test" onclick="sendRemoteCmd('TEST')">
+            🚨 テスト地震を遠隔発生
+        </button>
+    </div>
+
+    <!-- Leaflet.js の JS読み込み -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // URLパラメータのチェック（?remote=ID があればリモコンモード）
+        const urlParams = new URLSearchParams(window.location.search);
+        const remoteId = urlParams.get('remote');
+        let myPeer = null;
+        let myRemoteConn = null;
+
+        // --- ① リモートコントローラー側の処理 ---
+        if (remoteId) {
+            document.getElementById('monitor-view').style.display = 'none';
+            document.getElementById('remote-view').style.display = 'flex';
+
+            myPeer = new Peer();
+            myPeer.on('open', () => {
+                myRemoteConn = myPeer.connect(remoteId);
+                myRemoteConn.on('open', () => {
+                    document.getElementById('remote-status').innerHTML = "✅ PCモニターと接続完了！<br>ボタンで操作できます。";
+                    document.getElementById('remote-status').style.color = "#00ff88";
+                });
+            });
+
+            function sendRemoteCmd(cmd) {
+                if (myRemoteConn && myRemoteConn.open) {
+                    myRemoteConn.send(cmd);
+                    // ボタンを押したフィードバック
+                    document.body.style.opacity = 0.5;
+                    setTimeout(() => document.body.style.opacity = 1, 150);
+                } else {
+                    alert("PCとの接続が切れています。PC側の画面を更新してください。");
+                }
+            }
+        } 
+        // --- ② PCモニター側の処理 ---
+        else {
+            initMonitor();
+        }
+
+        function initMonitor() {
+            // PeerJSの初期化（受信側）
+            const myMonitorId = 'eq-monitor-' + Math.floor(100000 + Math.random() * 900000);
+            myPeer = new Peer(myMonitorId);
+
+            myPeer.on('open', (id) => {
+                // スマホ用リンクを生成してサイドバーに表示
+                const remoteUrl = window.location.href.split('?')[0] + '?remote=' + id;
+                const linkElem = document.getElementById('remote-link');
+                linkElem.href = remoteUrl;
+                linkElem.innerText = remoteUrl;
+            });
+
+            myPeer.on('connection', (conn) => {
+                conn.on('data', (data) => {
+                    console.log("リモコンからの命令を受信: ", data);
+                    if (data === 'STOP') {
+                        stopAudioAndSpeech(); // 音声を停止
+                    } else if (data === 'TEST') {
+                        runTestSimulation(); // テスト発報
+                    }
+                });
+            });
+
+            // 以降は既存の地図・地震監視プログラム
+            const map = L.map('map').setView([36.45, 136.58], 8);
+            L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+                attribution: 'Tiles &copy; Esri', maxZoom: 16
+            }).addTo(map);
+
+            const userLat = 36.45, userLon = 136.58;
+            const homeIcon = L.divIcon({
+                className: '', html: '<div style="font-size: 24px; text-shadow: 0 0 5px #000;">🏠</div>', iconSize: [30, 30], iconAnchor: [15, 15]
+            });
+            L.marker([userLat, userLon], {icon: homeIcon}).addTo(map).bindPopup("<b>マイホーム</b>");
+
+            let epicenterMarker = null;
+            let pointMarkers = [];
+            let pWaveCircle = null;
+            let sWaveCircle = null;
+            let waveInterval = null;
+            let isTestMode = false;
+            let lastEarthquakeId = null;
+
+            const scale5OverAudio = new Audio('nc239565_【アラームSE】_警報音・警告音・緊急_02_【シンセ・効果音】_2.mp3');
+            scale5OverAudio.preload = 'auto';
+
+            if (window.Notification && Notification.permission !== "granted") Notification.requestPermission();
+
+            // 音声停止関数（グローバルに設定）
+            window.stopAudioAndSpeech = function() {
+                if (window.speechSynthesis) window.speechSynthesis.cancel();
+                if (scale5OverAudio) {
+                    scale5OverAudio.pause();
+                    scale5OverAudio.currentTime = 0;
+                }
+                const alertArea = document.getElementById('alertArea');
+                if (alertArea.innerHTML.includes('🚨') || alertArea.innerHTML.includes('🌊')) {
+                    alertArea.innerHTML += `<div style="font-size:12px; color:#ccc; margin-top:5px;">※音声を手動停止しました</div>`;
+                }
+            }
+            window.toggleTestPanel = function() {
+                const panel = document.getElementById('testPanel');
+                panel.style.display = panel.style.display === 'block' ? 'none' : 'block';
+            }
+
+            function scaleToString(scale) {
+                const scales = { 10:"1", 20:"2", 30:"3", 40:"4", 45:"5弱", 50:"5強", 55:"6弱", 60:"6強", 70:"7" };
+                return scales[scale] || "-";
+            }
+            function getScaleColor(scale) {
+                if (scale >= 55) return '#ff0000';
+                if (scale >= 45) return '#ff8c00';
+                if (scale >= 40) return '#e6e600';
+                if (scale >= 30) return '#00aa00';
+                return '#0088ff';
+            }
+            function clearMarkers() {
+                if (epicenterMarker) map.removeLayer(epicenterMarker);
+                pointMarkers.forEach(m => map.removeLayer(m));
+                pointMarkers = [];
+                if (pWaveCircle) map.removeLayer(pWaveCircle);
+                if (sWaveCircle) map.removeLayer(sWaveCircle);
+                if (waveInterval) clearInterval(waveInterval);
+            }
+
+            function speakEarthquakeInfo(timeStr, hypoName, mag, depth, maxScale, tsunami) {
+                if (!window.speechSynthesis) return;
+                window.speechSynthesis.cancel();
+                let scaleStr = scaleToString(maxScale);
+                let tsunamiText = tsunami === 'Warning' ? "津波警報等が発表されています。高台へ避難してください。" : (tsunami === 'Checking' ? "津波の有無を調査中です。" : "津波の心配はありません。");
+                const message = `${timeStr}、地震がありました。震源地は、${hypoName}。マグニチュードは、${mag}。深さは、約${depth}キロメートル。最大震度は、震度${scaleStr}です。${tsunamiText}`;
+                const utterance = new SpeechSynthesisUtterance(message);
+                utterance.lang = 'ja-JP'; utterance.rate = 1.1;
+                window.speechSynthesis.speak(utterance);
+            }
+
+            function startWaveAnimation(lat, lon) {
+                if (waveInterval) clearInterval(waveInterval);
+                if (pWaveCircle) map.removeLayer(pWaveCircle);
+                if (sWaveCircle) map.removeLayer(sWaveCircle);
+                let pRadius = 0, sRadius = 0;
+                const pSpeed = 7.0, sSpeed = 3.5; 
+                const dLat = (userLat - lat) * 111, dLon = (userLon - lon) * 111 * Math.cos(lat * Math.PI / 180);
+                const distanceToUser = Math.sqrt(dLat * dLat + dLon * dLon);
+
+                waveInterval = setInterval(() => {
+                    pRadius += pSpeed * 1000; sRadius += sSpeed * 1000;
+                    if (!pWaveCircle) pWaveCircle = L.circle([lat, lon], { color: '#00ffff', fillColor: '#00ffff', fillOpacity: 0.08, radius: pRadius, weight: 1.5 }).addTo(map);
+                    else pWaveCircle.setRadius(pRadius);
+                    if (!sWaveCircle) sWaveCircle = L.circle([lat, lon], { color: '#ff3333', fillColor: '#ff3333', fillOpacity: 0.15, radius: sRadius, weight: 2.5 }).addTo(map);
+                    else sWaveCircle.setRadius(sRadius);
+
+                    const pDistKm = pRadius / 1000, sDistKm = sRadius / 1000;
+                    const pElem = document.getElementById('pWaveStatus'), sElem = document.getElementById('sWaveStatus');
+                    
+                    if (pDistKm >= distanceToUser) pElem.innerHTML = `P波: <span style="color:#00ff88;">自宅に到達済み！</span>`;
+                    else pElem.innerHTML = `P波 到達まで: 約 ${Math.max(0, Math.ceil((distanceToUser - pDistKm) / pSpeed))} 秒`;
+
+                    if (sDistKm >= distanceToUser) sElem.innerHTML = `S波: <span style="color:#ff3333; font-weight:bold;">🚨 強い揺れ警戒！</span>`;
+                    else sElem.innerHTML = `S波 到達まで: 約 ${Math.max(0, Math.ceil((distanceToUser - sDistKm) / sSpeed))} 秒`;
+
+                    if (pRadius > 600000) clearInterval(waveInterval);
+                }, 1000);
+            }
+
+            function playSynth(type, freq, delay, count) {
+                try {
+                    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    for (let i = 0; i < count; i++) {
+                        setTimeout(() => {
+                            const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+                            osc.type = type;
+                            if(type === 'sawtooth') {
+                                osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+                                osc.frequency.linearRampToValueAtTime(750, audioCtx.currentTime + 0.35);
+                                osc.frequency.linearRampToValueAtTime(400, audioCtx.currentTime + 0.7);
+                                gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+                                osc.start(); osc.stop(audioCtx.currentTime + 0.7);
+                            } else {
+                                osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+                                if(type==='triangle') osc.frequency.linearRampToValueAtTime(freq-100, audioCtx.currentTime + 0.25);
+                                gain.gain.setValueAtTime(type==='square'?0.15:0.08, audioCtx.currentTime);
+                                osc.start(); osc.stop(audioCtx.currentTime + (type==='triangle'?0.25:0.3));
+                            }
+                            osc.connect(gain); gain.connect(audioCtx.destination);
+                        }, i * delay);
+                    }
+                } catch (e) { console.log(e); }
+            }
+
+            function playScale5OverSound() {
+                scale5OverAudio.currentTime = 0;
+                scale5OverAudio.play().catch(error => { playSynth('square', 950, 200, 5); });
+            }
+
+            function triggerNotification(timeStr, hypoName, mag, depth, maxScale, tsunami) {
+                const scaleStr = scaleToString(maxScale);
+                if (tsunami === 'Warning') playSynth('sawtooth', 0, 750, 4);
+                else if (tsunami === 'Checking') playSynth('triangle', 300, 300, 3);
+                else if (maxScale >= 45) playScale5OverSound();
+                else if (maxScale >= 30) playSynth('sine', 784, 300, 3);
+                else playSynth('sine', 523.25, 350, 2);
+
+                speakEarthquakeInfo(timeStr, hypoName, mag, depth, maxScale, tsunami);
+
+                const alertArea = document.getElementById('alertArea');
+                if (tsunami === 'Warning') alertArea.innerHTML = `<div class="notification-banner">🌊 津波警報発令！高台へ避難</div>`;
+                else if (tsunami === 'Checking') alertArea.innerHTML = `<div class="notification-banner" style="background:#ffcc00; color:#111;">⚠️ 津波の有無を調査中</div>`;
+                else if (maxScale >= 45) alertArea.innerHTML = `<div class="notification-banner">🚨 強い地震（震度 ${scaleStr}以上）！</div>`;
+                else alertArea.innerHTML = `<div class="notification-banner" style="background:#0088ff;">🚨 地震検知 (最大震度 ${scaleStr})</div>`;
+            }
+
+            function displayEarthquakeData(timeStr, hypoName, mag, depth, maxScale, tsunami, lat, lon, points = []) {
+                document.getElementById('eqTime').innerText = timeStr;
+                document.getElementById('hypo').innerText = hypoName;
+                document.getElementById('mag').innerText = 'M ' + mag;
+                document.getElementById('depth').innerText = depth + ' km';
+                document.getElementById('maxScale').innerText = '震度 ' + scaleToString(maxScale);
+                document.getElementById('tsunamiArea').innerHTML = tsunami === 'Warning' ? '<div class="tsunami-alert">🌊 津波警報発表中！</div>' : (tsunami === 'Checking' ? '<div style="color:#ffcc00; font-size:13px; font-weight:bold; margin-top:5px;">⚠️ 津波調査中</div>' : '');
+
+                clearMarkers();
+                if (lat && lon && lat !== -1 && lon !== -1) {
+                    const epicIcon = L.divIcon({ className: '', html: '<div style="font-size:26px; color:red; font-weight:bold; text-shadow:0 0 4px #000; text-align:center;">❌</div>', iconSize: [30, 30], iconAnchor: [15, 15] });
+                    epicenterMarker = L.marker([lat, lon], {icon: epicIcon}).addTo(map).bindPopup(`<b>発生: ${timeStr}</b><br>震源: ${hypoName}<br>M: ${mag} / 深さ: ${depth}km`);
+                    map.setView([lat, lon], 8);
+                    startWaveAnimation(lat, lon);
+                }
+
+                points.forEach(p => {
+                    if (p.lat && p.lon && p.lat !== -1 && p.lon !== -1) {
+                        const color = getScaleColor(p.scale);
+                        const badgeHtml = `<div style="width:26px; height:26px; background-color:${color}; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:bold; font-size:11px; color:#000; border:2px solid #fff;">${scaleToString(p.scale)}</div>`;
+                        const icon = L.divIcon({ className: '', html: badgeHtml, iconSize: [26, 26], iconAnchor: [13, 13] });
+                        const marker = L.marker([p.lat, p.lon], {icon: icon}).addTo(map).bindPopup(`<b>${p.addr}</b><br>震度: ${scaleToString(p.scale)}`);
+                        pointMarkers.push(marker);
+                    }
+                });
+            }
+
+            async function fetchEarthquake() {
+                try {
+                    const response = await fetch('https://api.p2pquake.net/v2/history?codes=551&limit=1');
+                    const data = await response.json();
+                    if (data && data.length > 0) {
+                        const item = data[0], eq = item.earthquake, hypo = eq.hypocenter, currentId = item.id;
+                        const timeStr = eq.time || item.time || '-';
+
+                        if (lastEarthquakeId !== null && lastEarthquakeId !== currentId) {
+                            if (isTestMode) { isTestMode = false; document.getElementById('testPanel').style.display = 'none'; }
+                            triggerNotification(timeStr, hypo.name || '不明', hypo.magnitude || '-', hypo.depth || '-', eq.maxScale || 0, eq.tsunami || 'None');
+                        }
+                        lastEarthquakeId = currentId;
+
+                        if (!isTestMode) {
+                            const points = (eq.points || []).map(pt => ({ addr: pt.addr, scale: pt.scale, lat: pt.latitude, lon: pt.longitude }));
+                            document.getElementById('status').innerText = '1秒監視中 (更新: ' + new Date().toLocaleTimeString() + ')';
+                            displayEarthquakeData(timeStr, hypo.name || '不明', hypo.magnitude || '-', hypo.depth || '-', eq.maxScale || 0, eq.tsunami || 'None', hypo.latitude, hypo.longitude, points);
+                        }
+                    }
+                } catch (error) {
+                    if (!isTestMode) document.getElementById('status').innerText = '通信エラー（再試行中...）';
+                }
+            }
+
+            window.runTestSimulation = function() {
+                isTestMode = true;
+                const name = document.getElementById('testName').value, mag = document.getElementById('testMag').value, depth = document.getElementById('testDepth').value, scale = parseInt(document.getElementById('testScale').value), tsunami = document.getElementById('testTsunami').value;
+                const now = new Date();
+                const timeStr = `${now.getFullYear()}/${(now.getMonth()+1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
+                
+                let lat = 37.3917, lon = 136.9039;
+                const testPoints = [{ addr: "輪島市河井町", scale: scale, lat: 37.3917, lon: 136.9039 }, { addr: "白山市（自宅周辺）", scale: 30, lat: userLat, lon: userLon }];
+
+                document.getElementById('status').innerText = '【テストモード作動中】';
+                triggerNotification(timeStr, name, mag, depth, scale, tsunami);
+                displayEarthquakeData(timeStr, name, mag, depth, scale, tsunami, lat, lon, testPoints);
+                document.getElementById('testPanel').style.display = 'none';
+            }
+
+            fetchEarthquake();
+            setInterval(fetchEarthquake, 1000);
+        }
+    </script>
+</body>
+</html>
